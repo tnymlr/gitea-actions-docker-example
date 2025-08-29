@@ -1,0 +1,44 @@
+name: Test DIND Integration
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test-docker:
+    runs-on: linux
+    
+    services:
+      docker:
+        image: registry:5000/dind-plain:latest
+    
+    env:
+      DOCKER_HOST: tcp://docker:2376
+      DOCKER_TLS_VERIFY: ""
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Verify Docker daemon is running
+        run: |
+          echo "Testing Docker daemon connection..."
+          docker info
+      
+      - name: List running containers
+        run: |
+          echo "Listing all containers..."
+          docker ps -a
+      
+      - name: Test Docker functionality
+        run: |
+          echo "Testing basic Docker operations..."
+          docker run --rm hello-world
+          
+      - name: Verify DIND isolation
+        run: |
+          echo "Testing container isolation..."
+          docker run --rm alpine:latest echo "DIND is working perfectly!"

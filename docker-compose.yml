@@ -1,0 +1,187 @@
+services:
+  gitea:
+    image: gitea/gitea:latest
+    container_name: gitea
+    ports:
+      - "3000:3000"
+      - "2222:22"
+    volumes:
+      - gitea_data:/data
+      - ./app.ini:/data/gitea/conf/app.ini:ro
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  dind:
+    build: .
+    container_name: dind
+    privileged: true
+    volumes:
+      - dind_data:/var/lib/docker
+    environment:
+      - DOCKER_HOST=tcp://localhost:2376
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  registry:
+    image: registry:2
+    container_name: registry
+    volumes:
+      - registry_data:/var/lib/registry
+    environment:
+      - REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/var/lib/registry
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5000/v2/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  image-builder:
+    image: docker:dind
+    container_name: image-builder
+    depends_on:
+      registry:
+        condition: service_healthy
+      dind:
+        condition: service_healthy
+    volumes:
+      - ./Dockerfile:/workspace/Dockerfile
+      - dind_data:/var/lib/docker
+    working_dir: /workspace
+    command: >
+      sh -c "
+        export DOCKER_HOST=tcp://dind:2376
+        export DOCKER_TLS_VERIFY=""
+        echo 'Building and pushing DIND image to local registry...'
+        docker build -t registry:5000/dind-plain:latest .
+        docker push registry:5000/dind-plain:latest
+        echo 'Image build and push complete!'
+      "
+    restart: "no"
+
+  runner-configurator:
+    image: gitea/gitea:latest
+    container_name: runner-configurator
+    depends_on:
+      gitea:
+        condition: service_healthy
+    volumes:
+      - runner_config:/config
+      - ./app.ini:/data/gitea/conf/app.ini:ro
+    command: >
+      sh -c "
+        echo 'Gitea is healthy, proceeding...'
+        echo 'Generating runner token...'
+        su - git -c 'cd /data && /usr/local/bin/gitea actions generate-runner-token' > /config/token
+        echo 'Creating runner config...'
+        GITEA_IP=$$(getent hosts gitea | awk '{print $$1}')
+        REGISTRY_IP=$$(getent hosts registry | awk '{print $$1}')
+        echo \"Resolved Gitea IP: $$GITEA_IP\"
+        cat > /config/config.yaml << EOF
+      log:
+        level: info
+      runner:
+        file: .runner
+        capacity: 1
+        timeout: 3h
+        insecure: false
+        fetch_timeout: 5s
+        fetch_interval: 2s
+        labels:
+          - 'ubuntu-latest:docker://gitea/runner-images:ubuntu-latest'
+          - 'ubuntu-22.04:docker://gitea/runner-images:ubuntu-22.04'
+          - 'ubuntu-20.04:docker://gitea/runner-images:ubuntu-20.04'
+          - 'linux:docker://gitea/runner-images:ubuntu-latest'
+      cache:
+        enabled: true
+        dir: '/tmp/cache'
+        host: ''
+        port: 0
+      container:
+        network_mode: bridge
+        enable_ipv6: false
+        privileged: true
+        valid_volumes:
+          - '**'
+        docker_host: tcp://dind:2376
+        options: '--add-host=gitea:$$GITEA_IP --add-host=registry:$$REGISTRY_IP'
+      host:
+        workdir_parent: /tmp
+      EOF
+        echo 'Configuration complete!'
+      "
+    restart: "no"
+
+  admin-setup:
+    image: gitea/gitea:latest
+    container_name: admin-setup
+    depends_on:
+      gitea:
+        condition: service_healthy
+    environment:
+      - GITEA_URL=http://gitea:3000
+    volumes:
+      - gitea_data:/data
+      - ./app.ini:/data/gitea/conf/app.ini:ro
+    command: >
+      sh -c "
+        echo 'Creating admin user...'
+        su - git -c '/usr/local/bin/gitea admin user create --admin --username admin --password admin --email admin@localhost.local --must-change-password=false' || echo 'Admin user already exists'
+        echo 'Admin setup complete!'
+      "
+    restart: "no"
+
+  runner:
+    image: gitea/act_runner:latest
+    container_name: runner
+    depends_on:
+      gitea:
+        condition: service_healthy
+      dind:
+        condition: service_healthy
+      admin-setup:
+        condition: service_completed_successfully
+      runner-configurator:
+        condition: service_completed_successfully
+      image-builder:
+        condition: service_completed_successfully
+    volumes:
+      - runner_config:/config:ro
+      - runner_data:/data
+    environment:
+      - DOCKER_HOST=tcp://dind:2376
+      - DOCKER_TLS_VERIFY=""
+      - GITEA_INSTANCE_URL=http://gitea:3000
+      - GITEA_RUNNER_REGISTRATION_TOKEN_FILE=/config/token
+      - CONFIG_FILE=/config/config.yaml
+    command: >
+      sh -c "
+        echo 'All dependencies ready, token file available...'
+        echo 'Registering and starting runner...'
+        act_runner register --config /config/config.yaml --no-interactive
+        act_runner daemon --config /config/config.yaml
+      "
+    restart: unless-stopped
+
+volumes:
+  gitea_data:
+  dind_data:
+  runner_config:
+  runner_data:
+  registry_data:
